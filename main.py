@@ -18,8 +18,8 @@ logger = logging.getLogger(__name__)
 
 # MongoDB Configuration
 # NOTE: MONGODB_URI को ENVIRONMENT VARIABLE में सेट करना बेहतर है
-MONGODB_URI = os.getenv('MONGODB_URI', 'mongodb://localhost:27017/')
-DB_NAME = 'telegram_bot_manager'
+MONGODB_URI = os.getenv('MONGODB_URI', 'mongodb+srv://rj5706603:O95nvJYxapyDHfkw@cluster0.fzmckei.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0')
+DB_NAME = 'Cluster0'
 
 # Timezone
 IST = pytz.timezone('Asia/Kolkata')
