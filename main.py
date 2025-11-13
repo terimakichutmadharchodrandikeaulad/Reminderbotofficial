@@ -3,7 +3,7 @@ import asyncio
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, filters
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 import logging
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
@@ -17,6 +17,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # MongoDB Configuration
+# NOTE: MONGODB_URI को ENVIRONMENT VARIABLE में सेट करना बेहतर है
 MONGODB_URI = os.getenv('MONGODB_URI', 'mongodb://localhost:27017/')
 DB_NAME = 'telegram_bot_manager'
 
@@ -281,7 +282,443 @@ class BotManager:
                         # Send reminder
                         await bot.send_message(
                             chat_id=reminder['chat_id'],
-                            text=f"🔔 <b>⚠️ Important:</b>
+                            text=f"🔔 <b>REMINDER!</b>\n\n"
+                                 f"📝 {reminder['message']}\n\n"
+                                 f"⏰ Scheduled for: {reminder['remind_time'].strftime('%d-%m-%Y %I:%M %p')}",
+                            parse_mode='HTML'
+                        )
+                        
+                        # Update status
+                        await self.db.update_reminder_status(str(reminder['_id']), 'completed')
+                        
+                        # Log analytics
+                        await self.db.log_analytics('reminder_sent', {
+                            'user_id': reminder['user_id'],
+                            'reminder_id': str(reminder['_id'])
+                        })
+                        
+                    except Exception as e:
+                        logger.error(f"Error sending reminder: {e}")
+                        await self.db.update_reminder_status(str(reminder['_id']), 'error')
+                
+            except Exception as e:
+                logger.error(f"Error in reminder checker: {e}")
+            
+            await asyncio.sleep(10)  # Check every 10 seconds
+    
+    def _register_handlers(self, app: Application, is_master: bool = False, owner_id: str = None):
+        """Register command handlers"""
+        app.add_handler(CommandHandler("start", start_command))
+        app.add_handler(CommandHandler("remind", remind_command))
+        app.add_handler(CommandHandler("list", list_reminders))
+        app.add_handler(CommandHandler("delete", delete_reminder))
+        app.add_handler(CommandHandler("help", help_command))
+        app.add_handler(CommandHandler("status", status_command))
+        app.add_handler(CommandHandler("stats", stats_command))
+        
+        if is_master:
+            app.add_handler(CommandHandler("clone", clone_command))
+            app.add_handler(CommandHandler("settoken", set_token_command))
+            app.add_handler(CommandHandler("mystop", stop_my_bot))
+            app.add_handler(CommandHandler("mystart", restart_my_bot))
+            app.add_handler(CommandHandler("mydelete", delete_my_clone))
+            app.add_handler(CommandHandler("admin", admin_command))
+            app.add_handler(CommandHandler("broadcast", broadcast_command))
+            app.add_handler(CommandHandler("analytics", analytics_command))
+        
+        app.add_handler(CallbackQueryHandler(button_callback))
+        app.add_error_handler(error_handler)
+
+# ==================== COMMAND HANDLERS ====================
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    db = context.application.bot_data['db']
+    
+    # Create or update user
+    user_data = {
+        'user_id': str(user.id),
+        'first_name': user.first_name,
+        'last_name': user.last_name,
+        'username': user.username,
+        'language_code': user.language_code,
+        'is_bot': user.is_bot,
+        'last_active': datetime.now(IST),
+        'created_at': datetime.now(IST)
+    }
+    
+    existing_user = await db.get_user(str(user.id))
+    if existing_user:
+        user_data['created_at'] = existing_user['created_at']
+    
+    await db.create_or_update_user(user_data)
+    await db.log_analytics('user_start', {'user_id': str(user.id)})
+    
+    # Check if master or clone
+    owner_id = context.application.bot_data.get('owner_id')
+    is_master = owner_id is None
+    
+    if is_master:
+        stats = await db.get_analytics_summary()
+        text = f"""
+🎯 <b>Welcome {user.first_name}!</b>
+
+Main ek <b>Advanced AI-Powered Reminder Bot</b> hoon jo automatically clone bhi ban sakta hai!
+
+<b>✨ Premium Features:</b>
+• ⏰ Smart Time-based Reminders
+• 🤖 Auto Clone System (24/7)
+• 📊 Advanced Analytics
+• 💾 MongoDB Database
+• 🔔 Real-time Notifications
+• 📈 Usage Statistics
+
+<b>🚀 Quick Start:</b>
+/remind - Set smart reminder
+/list - View all reminders
+/clone - Create your bot
+/stats - Your statistics
+
+<b>📊 Global Stats:</b>
+• Users: {stats['total_users']} ({stats['new_users_today']} today)
+• Active Reminders: {stats['total_reminders']}
+• Clone Bots: {stats['total_clones']}
+• Completed: {stats['total_completed']}
+
+<b>🎁 Special Feature:</b>
+Create your own bot that runs 24/7 on our server - FREE!
+        """
+    else:
+        clone = await db.get_clone(owner_id)
+        owner_name = clone.get('owner_name', 'Owner') if clone else 'Owner'
+        
+        text = f"""
+🎯 <b>Welcome {user.first_name}!</b>
+
+Yeh <b>{owner_name}</b> ka Personal Clone Bot hai!
+
+<b>📌 Available Commands:</b>
+/remind - Set reminder
+/list - View reminders
+/delete - Remove reminder
+/stats - Your statistics
+/status - Bot information
+/help - Complete guide
+
+<b>🔥 Powered by Advanced MongoDB</b>
+<b>⚡ Running 24/7 Automatically</b>
+        """
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("⏰ Set Reminder", callback_data="guide_remind"),
+            InlineKeyboardButton("📊 My Stats", callback_data="my_stats")
+        ]
+    ]
+    
+    if is_master:
+        keyboard.append([
+            InlineKeyboardButton("🤖 Clone Bot", callback_data="guide_clone"),
+            InlineKeyboardButton("📈 Analytics", callback_data="view_analytics")
+        ])
+    
+    keyboard.append([InlineKeyboardButton("❓ Help", callback_data="show_help")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(text, parse_mode='HTML', reply_markup=reply_markup)
+
+async def remind_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db = context.application.bot_data['db']
+    
+    if not context.args:
+        keyboard = [
+            [
+                InlineKeyboardButton("⚡ 10 min", callback_data="quick_10m"),
+                InlineKeyboardButton("⏰ 30 min", callback_data="quick_30m")
+            ],
+            [
+                InlineKeyboardButton("🕐 1 hour", callback_data="quick_1h"),
+                InlineKeyboardButton("🕑 2 hours", callback_data="quick_2h")
+            ],
+            [
+                InlineKeyboardButton("📅 1 day", callback_data="quick_1d"),
+                InlineKeyboardButton("📆 1 week", callback_data="quick_7d")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            "❌ <b>Format Required!</b>\n\n"
+            "<b>Correct Format:</b>\n"
+            "<code>/remind message @time</code>\n\n"
+            "<b>Examples:</b>\n"
+            "• <code>/remind Drink water @10m</code>\n"
+            "• <code>/remind Gym workout @2h</code>\n"
+            "• <code>/remind Project deadline @3d</code>\n"
+            "• <code>/remind Weekly meeting @7d</code>\n\n"
+            "<b>Time Formats:</b>\n"
+            "• m = minutes (1-1440)\n"
+            "• h = hours (1-168)\n"
+            "• d = days (1-365)\n\n"
+            "<b>Or use quick buttons below:</b>",
+            parse_mode='HTML',
+            reply_markup=reply_markup
+        )
+        return
+    
+    text = ' '.join(context.args)
+    
+    if '@' not in text:
+        await update.message.reply_text(
+            "❌ Time missing! Use format: <code>message @time</code>",
+            parse_mode='HTML'
+        )
+        return
+    
+    parts = text.split('@')
+    message = parts[0].strip()
+    time_str = parts[1].strip().lower()
+    
+    # Validate message
+    if len(message) < 3:
+        await update.message.reply_text("❌ Message too short! Minimum 3 characters required.")
+        return
+    
+    if len(message) > 500:
+        await update.message.reply_text("❌ Message too long! Maximum 500 characters allowed.")
+        return
+    
+    # Parse time
+    try:
+        if time_str.endswith('m'):
+            minutes = int(time_str[:-1])
+            if minutes < 1 or minutes > 1440:
+                raise ValueError("Minutes must be between 1-1440")
+            remind_time = datetime.now(IST) + timedelta(minutes=minutes)
+            time_display = f"{minutes} minute{'s' if minutes > 1 else ''}"
+        elif time_str.endswith('h'):
+            hours = int(time_str[:-1])
+            if hours < 1 or hours > 168:
+                raise ValueError("Hours must be between 1-168")
+            remind_time = datetime.now(IST) + timedelta(hours=hours)
+            time_display = f"{hours} hour{'s' if hours > 1 else ''}"
+        elif time_str.endswith('d'):
+            days = int(time_str[:-1])
+            if days < 1 or days > 365:
+                raise ValueError("Days must be between 1-365")
+            remind_time = datetime.now(IST) + timedelta(days=days)
+            time_display = f"{days} day{'s' if days > 1 else ''}"
+        else:
+            await update.message.reply_text(
+                "❌ Invalid time format!\n\n"
+                "Use: m (minutes), h (hours), d (days)\n"
+                "Example: @30m, @2h, @1d"
+            )
+            return
+    except ValueError as e:
+        await update.message.reply_text(f"❌ {str(e)}")
+        return
+    
+    # Save reminder to database
+    user_id = str(update.effective_user.id)
+    owner_bot = context.application.bot_data.get('owner_id')
+    
+    reminder_data = {
+        'user_id': user_id,
+        'message': message,
+        'remind_time': remind_time,
+        'chat_id': update.effective_chat.id,
+        'owner_bot': owner_bot,
+        'status': 'active',
+        'created_at': datetime.now(IST),
+        'updated_at': datetime.now(IST)
+    }
+    
+    reminder_id = await db.create_reminder(reminder_data)
+    
+    # Log analytics
+    await db.log_analytics('reminder_created', {
+        'user_id': user_id,
+        'reminder_id': reminder_id
+    })
+    
+    await update.message.reply_text(
+        f"✅ <b>Reminder Created Successfully!</b>\n\n"
+        f"📝 <b>Message:</b> {message}\n"
+        f"⏰ <b>Time:</b> {time_display} from now\n"
+        f"🕐 <b>Exact Time:</b> {remind_time.strftime('%d-%m-%Y %I:%M %p')}\n"
+        f"🆔 <b>ID:</b> <code>{reminder_id}</code>\n\n"
+        f"💡 <b>Tip:</b> Use /list to view all reminders",
+        parse_mode='HTML'
+    )
+
+async def list_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db = context.application.bot_data['db']
+    user_id = str(update.effective_user.id)
+    
+    reminders = await db.get_user_reminders(user_id)
+    
+    if not reminders:
+        keyboard = [[InlineKeyboardButton("➕ Create Reminder", callback_data="guide_remind")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            "📭 <b>No Active Reminders</b>\n\n"
+            "You don't have any reminders right now.\n"
+            "Create one using /remind command!",
+            parse_mode='HTML',
+            reply_markup=reply_markup
+        )
+        return
+    
+    text = f"📋 <b>Your Active Reminders ({len(reminders)})</b>\n\n"
+    
+    for idx, reminder in enumerate(reminders, 1):
+        remind_time = reminder['remind_time']
+        time_left = remind_time - datetime.now(IST)
+        
+        if time_left.total_seconds() > 0:
+            days = time_left.days
+            hours = int(time_left.seconds // 3600)
+            minutes = int((time_left.seconds % 3600) // 60)
+            
+            if days > 0:
+                time_left_str = f"{days}d {hours}h"
+            elif hours > 0:
+                time_left_str = f"{hours}h {minutes}m"
+            else:
+                time_left_str = f"{minutes}m"
+        else:
+            time_left_str = "Sending..."
+        
+        text += f"<b>{idx}. #{str(reminder['_id'])[-6:]}</b>\n"
+        text += f"📝 {reminder['message'][:50]}{'...' if len(reminder['message']) > 50 else ''}\n"
+        text += f"⏰ {remind_time.strftime('%d-%m %I:%M %p')}\n"
+        text += f"⏳ <i>{time_left_str} left</i>\n\n"
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("➕ Add More", callback_data="guide_remind"),
+            InlineKeyboardButton("🗑️ Delete All", callback_data="delete_all_confirm")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(text, parse_mode='HTML', reply_markup=reply_markup)
+
+async def delete_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db = context.application.bot_data['db']
+    
+    if not context.args:
+        await update.message.reply_text(
+            "❌ <b>Reminder ID Required!</b>\n\n"
+            "<b>Usage:</b> <code>/delete REMINDER_ID</code>\n\n"
+            "<b>Example:</b> <code>/delete 507f1f77</code>\n\n"
+            "💡 Use /list to see all reminder IDs",
+            parse_mode='HTML'
+        )
+        return
+    
+    reminder_id_input = context.args[0]
+    user_id = str(update.effective_user.id)
+    
+    try:
+        # Get all user reminders to find matching ID
+        reminders = await db.get_user_reminders(user_id)
+        
+        matching_reminder = None
+        for reminder in reminders:
+            if str(reminder['_id']).endswith(reminder_id_input) or str(reminder['_id']) == reminder_id_input:
+                matching_reminder = reminder
+                break
+        
+        if not matching_reminder:
+            await update.message.reply_text(
+                "❌ <b>Reminder Not Found!</b>\n\n"
+                "Please check the ID and try again.\n"
+                "Use /list to see all your reminders.",
+                parse_mode='HTML'
+            )
+            return
+        
+        # Delete reminder
+        await db.delete_reminder(str(matching_reminder['_id']))
+        
+        # Log analytics
+        await db.log_analytics('reminder_deleted', {
+            'user_id': user_id,
+            'reminder_id': str(matching_reminder['_id'])
+        })
+        
+        await update.message.reply_text(
+            f"✅ <b>Reminder Deleted!</b>\n\n"
+            f"📝 {matching_reminder['message'][:50]}{'...' if len(matching_reminder['message']) > 50 else ''}\n\n"
+            f"Use /list to see remaining reminders.",
+            parse_mode='HTML'
+        )
+        
+    except Exception as e:
+        logger.error(f"Error deleting reminder: {e}")
+        await update.message.reply_text("❌ Error deleting reminder. Please try again.")
+
+async def clone_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db = context.application.bot_data['db']
+    user_id = str(update.effective_user.id)
+    
+    clone = await db.get_clone(user_id)
+    
+    if clone and clone.get('status') == 'active':
+        text = f"""
+✅ <b>Your Clone Bot is Active!</b>
+
+<b>🤖 Bot Information:</b>
+• Username: @{clone.get('username', 'N/A')}
+• Name: {clone.get('bot_name', 'N/A')}
+• Status: 🟢 Running 24/7
+
+<b>📅 Created:</b> {clone.get('created_at').strftime('%d-%m-%Y %I:%M %p') if clone.get('created_at') else 'N/A'}
+<b>⏰ Last Update:</b> {clone.get('updated_at').strftime('%d-%m-%Y %I:%M %p') if clone.get('updated_at') else 'N/A'}
+
+<b>🎮 Bot Management:</b>
+/mystop - Stop your bot
+/mystart - Restart your bot
+/mydelete - Delete your bot permanently
+
+<b>💡 Tip:</b> Your bot runs automatically on our server - FREE!
+        """
+    else:
+        text = """
+🤖 <b>Create Your Personal Clone Bot!</b>
+
+<b>✨ Benefits:</b>
+• Your own private reminder bot
+• Runs 24/7 on our server
+• Completely FREE
+• Full control over your bot
+• Automatic restart system
+
+<b>📝 Step-by-Step Guide:</b>
+
+1️⃣ <b>Open Telegram & Search:</b>
+   → @BotFather
+
+2️⃣ <b>Create New Bot:</b>
+   → Send: <code>/newbot</code>
+   → Choose bot name (e.g., "My Reminder Bot")
+   → Choose username (must end with 'bot')
+
+3️⃣ <b>Get Your Token:</b>
+   → BotFather will send you a token
+   → Copy the entire token
+
+4️⃣ <b>Set Token Here:</b>
+   → Send: <code>/settoken YOUR_TOKEN</code>
+
+5️⃣ <b>Done!</b>
+   → Your bot will start automatically
+   → You can use it immediately
+
+<b>⚠️ Important Security Note:</b>
 • Keep your token private & secure
 • Never share token with anyone
 • We store it encrypted in MongoDB
@@ -977,622 +1414,3 @@ Use /stats for detailed statistics!
             reply_markup=reply_markup
         )
     
-    elif query.data == "delete_all_confirmed":
-        count = await db.delete_all_user_reminders(user_id)
-        await query.edit_message_text(
-            f"✅ <b>All Reminders Deleted!</b>\n\n"
-            f"Removed {count} reminder(s).\n\n"
-            f"Create new ones with /remind",
-            parse_mode='HTML'
-        )
-    
-    elif query.data == "cancel_delete":
-        await query.edit_message_text("❌ Deletion cancelled.")
-    
-    elif query.data == "stop_clone":
-        await stop_my_bot(query, context)
-    
-    elif query.data == "restart_clone":
-        await restart_my_bot(query, context)
-    
-    elif query.data == "confirm_delete_clone":
-        bot_manager = context.application.bot_data.get('bot_manager')
-        if bot_manager:
-            await bot_manager.stop_clone_bot(user_id)
-        await db.delete_clone(user_id)
-        await db.log_analytics('clone_deleted', {'user_id': user_id})
-        await query.edit_message_text(
-            "✅ <b>Clone Bot Deleted!</b>\n\n"
-            "Your clone bot has been permanently removed.\n\n"
-            "You can create a new one anytime with /clone",
-            parse_mode='HTML'
-        )
-    
-    elif query.data == "cancel_delete_clone":
-        await query.edit_message_text("❌ Deletion cancelled.")
-    
-    elif query.data == "view_analytics":
-        await analytics_command(query, context)
-    
-    elif query.data == "show_help":
-        await help_command(query, context)
-
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"Error: {context.error}", exc_info=context.error)
-    try:
-        if update and update.effective_message:
-            await update.effective_message.reply_text(
-                "❌ <b>An Error Occurred!</b>\n\n"
-                "Please try again. If the problem persists, contact admin.\n\n"
-                "<b>Error logged for review.</b>",
-                parse_mode='HTML'
-            )
-    except Exception as e:
-        logger.error(f"Error in error handler: {e}")
-
-# ==================== MAIN FUNCTION ====================
-
-async def main():
-    """Main function to start the bot system"""
-    global db
-    
-    # Master bot token
-    MASTER_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-    
-    if not MASTER_TOKEN:
-        print("❌ Error: TELEGRAM_BOT_TOKEN environment variable not set!")
-        print("\nSet it with:")
-        print("  Linux/Mac: export TELEGRAM_BOT_TOKEN='your_token'")
-        print("  Windows: set TELEGRAM_BOT_TOKEN=your_token")
-        return
-    
-    # Initialize MongoDB
-    print("=" * 60)
-    print("🤖 Advanced Multi-Bot Manager with MongoDB")
-    print("=" * 60)
-    print(f"📅 Started: {datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S IST')}")
-    print("=" * 60)
-    
-    try:
-        print("🔌 Connecting to MongoDB...")
-        db = DatabaseManager(MONGODB_URI, DB_NAME)
-        
-        # Test connection
-        await db.users.find_one({})
-        print("✅ MongoDB connected successfully!")
-        
-    except Exception as e:
-        print(f"❌ MongoDB connection failed: {e}")
-        print("\nMake sure MongoDB is running:")
-        print("  Local: mongod --dbpath /path/to/data")
-        print("  Or set MONGODB_URI environment variable for remote DB")
-        return
-    
-    # Create indexes for better performance
-    try:
-        await db.users.create_index("user_id", unique=True)
-        await db.reminders.create_index([("user_id", 1), ("status", 1)])
-        await db.reminders.create_index("remind_time")
-        await db.clones.create_index("owner_id", unique=True)
-        await db.analytics.create_index("timestamp")
-        print("✅ Database indexes created!")
-    except Exception as e:
-        logger.warning(f"Index creation warning: {e}")
-    
-    # Create bot manager
-    print("🤖 Initializing bot manager...")
-    bot_manager = BotManager(MASTER_TOKEN, db)
-    
-    # Start master bot
-    await bot_manager.start_master_bot()
-    
-    stats = await db.get_analytics_summary()
-    print("\n" + "=" * 60)
-    print("✅ Master bot is RUNNING!")
-    print("=" * 60)
-    print(f"👥 Total Users: {stats['total_users']}")
-    print(f"⏰ Active Reminders: {stats['total_reminders']}")
-    print(f"🤖 Clone Bots: {len(ACTIVE_BOTS)}/{stats['total_clones']}")
-    print("=" * 60)
-    print("\n💡 Bot is ready to accept commands!")
-    print("🛑 Press Ctrl+C to stop all bots\n")
-    
-    # Keep running
-    try:
-        while True:
-            await asyncio.sleep(3600)  # Sleep for 1 hour
-            # Periodic health check
-            active_count = len(ACTIVE_BOTS)
-            if active_count > 0:
-                logger.info(f"Health check: {active_count} clone bots running")
-    
-    except KeyboardInterrupt:
-        print("\n" + "=" * 60)
-        print("🛑 Shutting down gracefully...")
-        print("=" * 60)
-        
-        # Stop all clone bots
-        print(f"Stopping {len(ACTIVE_BOTS)} clone bot(s)...")
-        for user_id in list(ACTIVE_BOTS.keys()):
-            try:
-                await bot_manager.stop_clone_bot(user_id)
-                print(f"  ✓ Stopped clone for user {user_id}")
-            except Exception as e:
-                logger.error(f"Error stopping clone {user_id}: {e}")
-        
-        # Stop master bot
-        print("Stopping master bot...")
-        if bot_manager.master_app:
-            try:
-                await bot_manager.master_app.updater.stop()
-                await bot_manager.master_app.stop()
-                await bot_manager.master_app.shutdown()
-                print("  ✓ Master bot stopped")
-            except Exception as e:
-                logger.error(f"Error stopping master: {e}")
-        
-        # Close database connection
-        print("Closing database connection...")
-        if db:
-            db.client.close()
-            print("  ✓ Database connection closed")
-        
-        print("=" * 60)
-        print("✅ All systems shut down successfully!")
-        print("=" * 60)
-
-# ==================== ENTRY POINT ====================
-
-if __name__ == '__main__':
-    print("\n" + "=" * 60)
-    print("  TELEGRAM BOT MANAGER - MONGODB EDITION")
-    print("=" * 60 + "\n")
-    
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\n👋 Goodbye! Thanks for using our bot!")
-    except Exception as e:
-        logger.error(f"Fatal error: {e}", exc_info=True)
-        print(f"\n❌ Critical error occurred: {e}")
-        print("Check logs for details.")
-    
-    print("\n" + "=" * 60)
-    print("  Bot Manager Terminated")
-    print("=" * 60 + "\n")>REMINDER!</b>\n\n"
-                                 f"📝 {reminder['message']}\n\n"
-                                 f"⏰ Scheduled for: {reminder['remind_time'].strftime('%d-%m-%Y %I:%M %p')}",
-                            parse_mode='HTML'
-                        )
-                        
-                        # Update status
-                        await self.db.update_reminder_status(str(reminder['_id']), 'completed')
-                        
-                        # Log analytics
-                        await self.db.log_analytics('reminder_sent', {
-                            'user_id': reminder['user_id'],
-                            'reminder_id': str(reminder['_id'])
-                        })
-                        
-                    except Exception as e:
-                        logger.error(f"Error sending reminder: {e}")
-                        await self.db.update_reminder_status(str(reminder['_id']), 'error')
-                
-            except Exception as e:
-                logger.error(f"Error in reminder checker: {e}")
-            
-            await asyncio.sleep(10)  # Check every 10 seconds
-    
-    def _register_handlers(self, app: Application, is_master: bool = False, owner_id: str = None):
-        """Register command handlers"""
-        app.add_handler(CommandHandler("start", start_command))
-        app.add_handler(CommandHandler("remind", remind_command))
-        app.add_handler(CommandHandler("list", list_reminders))
-        app.add_handler(CommandHandler("delete", delete_reminder))
-        app.add_handler(CommandHandler("help", help_command))
-        app.add_handler(CommandHandler("status", status_command))
-        app.add_handler(CommandHandler("stats", stats_command))
-        
-        if is_master:
-            app.add_handler(CommandHandler("clone", clone_command))
-            app.add_handler(CommandHandler("settoken", set_token_command))
-            app.add_handler(CommandHandler("mystop", stop_my_bot))
-            app.add_handler(CommandHandler("mystart", restart_my_bot))
-            app.add_handler(CommandHandler("mydelete", delete_my_clone))
-            app.add_handler(CommandHandler("admin", admin_command))
-            app.add_handler(CommandHandler("broadcast", broadcast_command))
-            app.add_handler(CommandHandler("analytics", analytics_command))
-        
-        app.add_handler(CallbackQueryHandler(button_callback))
-        app.add_error_handler(error_handler)
-
-# ==================== COMMAND HANDLERS ====================
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    db = context.application.bot_data['db']
-    
-    # Create or update user
-    user_data = {
-        'user_id': str(user.id),
-        'first_name': user.first_name,
-        'last_name': user.last_name,
-        'username': user.username,
-        'language_code': user.language_code,
-        'is_bot': user.is_bot,
-        'last_active': datetime.now(IST),
-        'created_at': datetime.now(IST)
-    }
-    
-    existing_user = await db.get_user(str(user.id))
-    if existing_user:
-        user_data['created_at'] = existing_user['created_at']
-    
-    await db.create_or_update_user(user_data)
-    await db.log_analytics('user_start', {'user_id': str(user.id)})
-    
-    # Check if master or clone
-    owner_id = context.application.bot_data.get('owner_id')
-    is_master = owner_id is None
-    
-    if is_master:
-        stats = await db.get_analytics_summary()
-        text = f"""
-🎯 <b>Welcome {user.first_name}!</b>
-
-Main ek <b>Advanced AI-Powered Reminder Bot</b> hoon jo automatically clone bhi ban sakta hai!
-
-<b>✨ Premium Features:</b>
-• ⏰ Smart Time-based Reminders
-• 🤖 Auto Clone System (24/7)
-• 📊 Advanced Analytics
-• 💾 MongoDB Database
-• 🔔 Real-time Notifications
-• 📈 Usage Statistics
-
-<b>🚀 Quick Start:</b>
-/remind - Set smart reminder
-/list - View all reminders
-/clone - Create your bot
-/stats - Your statistics
-
-<b>📊 Global Stats:</b>
-• Users: {stats['total_users']} ({stats['new_users_today']} today)
-• Active Reminders: {stats['total_reminders']}
-• Clone Bots: {stats['total_clones']}
-• Completed: {stats['total_completed']}
-
-<b>🎁 Special Feature:</b>
-Create your own bot that runs 24/7 on our server - FREE!
-        """
-    else:
-        clone = await db.get_clone(owner_id)
-        owner_name = clone.get('owner_name', 'Owner') if clone else 'Owner'
-        
-        text = f"""
-🎯 <b>Welcome {user.first_name}!</b>
-
-Yeh <b>{owner_name}</b> ka Personal Clone Bot hai!
-
-<b>📌 Available Commands:</b>
-/remind - Set reminder
-/list - View reminders
-/delete - Remove reminder
-/stats - Your statistics
-/status - Bot information
-/help - Complete guide
-
-<b>🔥 Powered by Advanced MongoDB</b>
-<b>⚡ Running 24/7 Automatically</b>
-        """
-    
-    keyboard = [
-        [
-            InlineKeyboardButton("⏰ Set Reminder", callback_data="guide_remind"),
-            InlineKeyboardButton("📊 My Stats", callback_data="my_stats")
-        ]
-    ]
-    
-    if is_master:
-        keyboard.append([
-            InlineKeyboardButton("🤖 Clone Bot", callback_data="guide_clone"),
-            InlineKeyboardButton("📈 Analytics", callback_data="view_analytics")
-        ])
-    
-    keyboard.append([InlineKeyboardButton("❓ Help", callback_data="show_help")])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(text, parse_mode='HTML', reply_markup=reply_markup)
-
-async def remind_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    db = context.application.bot_data['db']
-    
-    if not context.args:
-        keyboard = [
-            [
-                InlineKeyboardButton("⚡ 10 min", callback_data="quick_10m"),
-                InlineKeyboardButton("⏰ 30 min", callback_data="quick_30m")
-            ],
-            [
-                InlineKeyboardButton("🕐 1 hour", callback_data="quick_1h"),
-                InlineKeyboardButton("🕑 2 hours", callback_data="quick_2h")
-            ],
-            [
-                InlineKeyboardButton("📅 1 day", callback_data="quick_1d"),
-                InlineKeyboardButton("📆 1 week", callback_data="quick_7d")
-            ]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(
-            "❌ <b>Format Required!</b>\n\n"
-            "<b>Correct Format:</b>\n"
-            "<code>/remind message @time</code>\n\n"
-            "<b>Examples:</b>\n"
-            "• <code>/remind Drink water @10m</code>\n"
-            "• <code>/remind Gym workout @2h</code>\n"
-            "• <code>/remind Project deadline @3d</code>\n"
-            "• <code>/remind Weekly meeting @7d</code>\n\n"
-            "<b>Time Formats:</b>\n"
-            "• m = minutes (1-1440)\n"
-            "• h = hours (1-168)\n"
-            "• d = days (1-365)\n\n"
-            "<b>Or use quick buttons below:</b>",
-            parse_mode='HTML',
-            reply_markup=reply_markup
-        )
-        return
-    
-    text = ' '.join(context.args)
-    
-    if '@' not in text:
-        await update.message.reply_text(
-            "❌ Time missing! Use format: <code>message @time</code>",
-            parse_mode='HTML'
-        )
-        return
-    
-    parts = text.split('@')
-    message = parts[0].strip()
-    time_str = parts[1].strip().lower()
-    
-    # Validate message
-    if len(message) < 3:
-        await update.message.reply_text("❌ Message too short! Minimum 3 characters required.")
-        return
-    
-    if len(message) > 500:
-        await update.message.reply_text("❌ Message too long! Maximum 500 characters allowed.")
-        return
-    
-    # Parse time
-    try:
-        if time_str.endswith('m'):
-            minutes = int(time_str[:-1])
-            if minutes < 1 or minutes > 1440:
-                raise ValueError("Minutes must be between 1-1440")
-            remind_time = datetime.now(IST) + timedelta(minutes=minutes)
-            time_display = f"{minutes} minute{'s' if minutes > 1 else ''}"
-        elif time_str.endswith('h'):
-            hours = int(time_str[:-1])
-            if hours < 1 or hours > 168:
-                raise ValueError("Hours must be between 1-168")
-            remind_time = datetime.now(IST) + timedelta(hours=hours)
-            time_display = f"{hours} hour{'s' if hours > 1 else ''}"
-        elif time_str.endswith('d'):
-            days = int(time_str[:-1])
-            if days < 1 or days > 365:
-                raise ValueError("Days must be between 1-365")
-            remind_time = datetime.now(IST) + timedelta(days=days)
-            time_display = f"{days} day{'s' if days > 1 else ''}"
-        else:
-            await update.message.reply_text(
-                "❌ Invalid time format!\n\n"
-                "Use: m (minutes), h (hours), d (days)\n"
-                "Example: @30m, @2h, @1d"
-            )
-            return
-    except ValueError as e:
-        await update.message.reply_text(f"❌ {str(e)}")
-        return
-    
-    # Save reminder to database
-    user_id = str(update.effective_user.id)
-    owner_bot = context.application.bot_data.get('owner_id')
-    
-    reminder_data = {
-        'user_id': user_id,
-        'message': message,
-        'remind_time': remind_time,
-        'chat_id': update.effective_chat.id,
-        'owner_bot': owner_bot,
-        'status': 'active',
-        'created_at': datetime.now(IST),
-        'updated_at': datetime.now(IST)
-    }
-    
-    reminder_id = await db.create_reminder(reminder_data)
-    
-    # Log analytics
-    await db.log_analytics('reminder_created', {
-        'user_id': user_id,
-        'reminder_id': reminder_id
-    })
-    
-    await update.message.reply_text(
-        f"✅ <b>Reminder Created Successfully!</b>\n\n"
-        f"📝 <b>Message:</b> {message}\n"
-        f"⏰ <b>Time:</b> {time_display} from now\n"
-        f"🕐 <b>Exact Time:</b> {remind_time.strftime('%d-%m-%Y %I:%M %p')}\n"
-        f"🆔 <b>ID:</b> <code>{reminder_id}</code>\n\n"
-        f"💡 <b>Tip:</b> Use /list to view all reminders",
-        parse_mode='HTML'
-    )
-
-async def list_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    db = context.application.bot_data['db']
-    user_id = str(update.effective_user.id)
-    
-    reminders = await db.get_user_reminders(user_id)
-    
-    if not reminders:
-        keyboard = [[InlineKeyboardButton("➕ Create Reminder", callback_data="guide_remind")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(
-            "📭 <b>No Active Reminders</b>\n\n"
-            "You don't have any reminders right now.\n"
-            "Create one using /remind command!",
-            parse_mode='HTML',
-            reply_markup=reply_markup
-        )
-        return
-    
-    text = f"📋 <b>Your Active Reminders ({len(reminders)})</b>\n\n"
-    
-    for idx, reminder in enumerate(reminders, 1):
-        remind_time = reminder['remind_time']
-        time_left = remind_time - datetime.now(IST)
-        
-        if time_left.total_seconds() > 0:
-            days = time_left.days
-            hours = int(time_left.seconds // 3600)
-            minutes = int((time_left.seconds % 3600) // 60)
-            
-            if days > 0:
-                time_left_str = f"{days}d {hours}h"
-            elif hours > 0:
-                time_left_str = f"{hours}h {minutes}m"
-            else:
-                time_left_str = f"{minutes}m"
-        else:
-            time_left_str = "Sending..."
-        
-        text += f"<b>{idx}. #{str(reminder['_id'])[-6:]}</b>\n"
-        text += f"📝 {reminder['message'][:50]}{'...' if len(reminder['message']) > 50 else ''}\n"
-        text += f"⏰ {remind_time.strftime('%d-%m %I:%M %p')}\n"
-        text += f"⏳ <i>{time_left_str} left</i>\n\n"
-    
-    keyboard = [
-        [
-            InlineKeyboardButton("➕ Add More", callback_data="guide_remind"),
-            InlineKeyboardButton("🗑️ Delete All", callback_data="delete_all_confirm")
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(text, parse_mode='HTML', reply_markup=reply_markup)
-
-async def delete_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    db = context.application.bot_data['db']
-    
-    if not context.args:
-        await update.message.reply_text(
-            "❌ <b>Reminder ID Required!</b>\n\n"
-            "<b>Usage:</b> <code>/delete REMINDER_ID</code>\n\n"
-            "<b>Example:</b> <code>/delete 507f1f77</code>\n\n"
-            "💡 Use /list to see all reminder IDs",
-            parse_mode='HTML'
-        )
-        return
-    
-    reminder_id_input = context.args[0]
-    user_id = str(update.effective_user.id)
-    
-    try:
-        # Get all user reminders to find matching ID
-        reminders = await db.get_user_reminders(user_id)
-        
-        matching_reminder = None
-        for reminder in reminders:
-            if str(reminder['_id']).endswith(reminder_id_input) or str(reminder['_id']) == reminder_id_input:
-                matching_reminder = reminder
-                break
-        
-        if not matching_reminder:
-            await update.message.reply_text(
-                "❌ <b>Reminder Not Found!</b>\n\n"
-                "Please check the ID and try again.\n"
-                "Use /list to see all your reminders.",
-                parse_mode='HTML'
-            )
-            return
-        
-        # Delete reminder
-        await db.delete_reminder(str(matching_reminder['_id']))
-        
-        # Log analytics
-        await db.log_analytics('reminder_deleted', {
-            'user_id': user_id,
-            'reminder_id': str(matching_reminder['_id'])
-        })
-        
-        await update.message.reply_text(
-            f"✅ <b>Reminder Deleted!</b>\n\n"
-            f"📝 {matching_reminder['message'][:50]}{'...' if len(matching_reminder['message']) > 50 else ''}\n\n"
-            f"Use /list to see remaining reminders.",
-            parse_mode='HTML'
-        )
-        
-    except Exception as e:
-        logger.error(f"Error deleting reminder: {e}")
-        await update.message.reply_text("❌ Error deleting reminder. Please try again.")
-
-async def clone_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    db = context.application.bot_data['db']
-    user_id = str(update.effective_user.id)
-    
-    clone = await db.get_clone(user_id)
-    
-    if clone and clone.get('status') == 'active':
-        text = f"""
-✅ <b>Your Clone Bot is Active!</b>
-
-<b>🤖 Bot Information:</b>
-• Username: @{clone.get('username', 'N/A')}
-• Name: {clone.get('bot_name', 'N/A')}
-• Status: 🟢 Running 24/7
-
-<b>📅 Created:</b> {clone.get('created_at').strftime('%d-%m-%Y %I:%M %p') if clone.get('created_at') else 'N/A'}
-<b>⏰ Last Update:</b> {clone.get('updated_at').strftime('%d-%m-%Y %I:%M %p') if clone.get('updated_at') else 'N/A'}
-
-<b>🎮 Bot Management:</b>
-/mystop - Stop your bot
-/mystart - Restart your bot
-/mydelete - Delete your bot permanently
-
-<b>💡 Tip:</b> Your bot runs automatically on our server - FREE!
-        """
-    else:
-        text = """
-🤖 <b>Create Your Personal Clone Bot!</b>
-
-<b>✨ Benefits:</b>
-• Your own private reminder bot
-• Runs 24/7 on our server
-• Completely FREE
-• Full control over your bot
-• Automatic restart system
-
-<b>📝 Step-by-Step Guide:</b>
-
-1️⃣ <b>Open Telegram & Search:</b>
-   → @BotFather
-
-2️⃣ <b>Create New Bot:</b>
-   → Send: <code>/newbot</code>
-   → Choose bot name (e.g., "My Reminder Bot")
-   → Choose username (must end with 'bot')
-
-3️⃣ <b>Get Your Token:</b>
-   → BotFather will send you a token
-   → Copy the entire token
-
-4️⃣ <b>Set Token Here:</b>
-   → Send: <code>/settoken YOUR_TOKEN</code>
-
-5️⃣ <b>Done!</b>
-   → Your bot will start automatically
-   → You can use it immediately
-
-<b
