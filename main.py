@@ -6,7 +6,6 @@ from typing import Dict, Optional
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ( Application, CommandHandler, CallbackQueryHandler, ContextTypes )
-
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 import pytz
